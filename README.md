@@ -1,35 +1,51 @@
 # gomokuAI-trtangel
-use NVIDIA TensorRT to accelerate multi-thread selfplay. Basically I'm reproducing the paper of AlphaGO zero and Katago, but it is a gomoku project.
+This project uses NVIDIA TensorRT to play multi-thread, high performace selfplay. 
+
+After 3000 games selfplay, we use pytorch to train.
+
+Everything is inspired from Katago paper and code.
 
 
-I have fixed a lot of bugs of it, and it has runned well on my machine for several days. It won't become a very strong AI because I only reproduce few part of Katago. But as I said, I have fixed a lot of bugs, since I got most of it from AI. Anyway, thanks to Grok3, I finished my dream to build a MCTS ML AI.
 
-If you want to run it yourself:
 
-1、Compile.
-```
-g++ -g -I<YOURDIR>/TensorRT-10.2.0.19/include -I/usr/local/cuda-12.5/targets/x86_64-linux/include trtangel.cpp -L<YOURDIR>/TensorRT-10.2.0.19/lib -L/usr/local/cuda-12.5/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart -o trtangel_debug
-
-g++ -O2 -I<YOURDIR>/TensorRT-10.2.0.19/include -I/usr/local/cuda-12.5/targets/x86_64-linux/include trtangel.cpp -L<YOURDIR>/TensorRT-10.2.0.19/lib -L/usr/local/cuda-12.5/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart -o trtangel_release
-```
-2、Run selfplay.
-
-<thread_num><total_games><use_scorenet>
-```
-./trtangel_release selfplay 128 500 1     #It starts a selfplay with "ScoreNet", which is a CPU simple algorithm
-./trtangel_release selfplay 128 500 0     #It starts a selfplay with a real neural net, maybe you should run train.py to get model.onnx
-```
-3、Run train.
+1. Compile
 
 ```
-python3 train.py
+./make.sh
+```
+2. Run
+
+```
+./start.sh
 ```
 
-train produces three files, `model.pth` is used to train net, `model.onnx` is used to selfplay, `model.pt` is used to convert to ncnn model so I can use it to participate the gomocup championship.
+3. If you want to compile Gomocup version:
 
-4、Run gatekeeper.
+ ```
+python tobin.py
+cp model.bin gomocup/
+cd gomocup
+g++ -O2 gomocup.cpp pisqpipe.cpp -o pbrain-angel2026 and model.bin --static
+// Then zip pbrain-angel2026 and model.bin
+ ```
 
-<thread_num><total_games>
-```
-./trtangel_release gatekeeper 100 100
-```
+ 
+
+This is the result after 5 days training.
+
+| -           | SLOWRENJU19 | angel-3e | angel-1e | angel-2000w | angel-5000w | angel-2e | angel-1000w | ANGEL   |
+| ----------- | ----------- | -------- | -------- | ----------- | ----------- | -------- | ----------- | ------- |
+| SLOWRENJU19 | -           | 2 : 8    | 2 : 8    | 1 : 9       | 2 : 8       | 3 : 7    | 1 : 9       | 2 : 8   |
+| angel-3e    | 8 : 2       | -        | 6 : 4    | 3 : 7       | 4 : 6       | 4 : 6    | 1 : 9       | 0 : 10  |
+| angel-1e    | 8 : 2       | 4 : 6    | -        | 7 : 3       | 5 : 5       | 1 : 9    | 3 : 7       | 2 : 8   |
+| angel-2000w | 9 : 1       | 7 : 3    | 3 : 7    | -           | 8 : 2       | 4 : 6    | 2 : 8       | 3 : 7   |
+| angel-5000w | 8 : 2       | 6 : 4    | 5 : 5    | 2 : 8       | -           | 5 : 5    | 2 : 8       | 3 : 7   |
+| angel-2e    | 7 : 3       | 6 : 4    | 9 : 1    | 6 : 4       | 5 : 5       | -        | 3 : 7       | 0 : 10  |
+| angel-1000w | 9 : 1       | 9 : 1    | 7 : 3    | 8 : 2       | 8 : 2       | 7 : 3    | -           | 5 : 5   |
+| ANGEL       | 8 : 2       | 10 : 0   | 8 : 2    | 7 : 3       | 7 : 3       | 10 : 0   | 5 : 5       | -       |
+| 总比分      | 57 : 13     | 44 : 26  | 40 : 30  | 34 : 36     | 39 : 31     | 34 : 36  | 17 : 53     | 15 : 55 |
+| 胜负比      | 4.385       | 1.692    | 1.333    | 0.944       | 1.258       | 0.944    | 0.321       | 0.273   |
+| 得分        | 21          | 15       | 13       | 12          | 11          | 7        | 1           | 1       |
+
+
+2026/1/31 12:15 - 13:57
