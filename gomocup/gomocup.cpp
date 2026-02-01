@@ -8,253 +8,540 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <immintrin.h> // AVX2 support
 
 // ==========================================
-// Part 1: ÍøÂçÍÆÀíºËĞÄ (´Ó main.c ÒÆÖ²)
+// Part 1: é«˜æ€§èƒ½ç½‘ç»œæ¨ç† (AVX2 + NHWC)
 // ==========================================
 
 #define TRUE 1
 #define FALSE 0
-#define NN_BOARD_SIZE 20  // ÍøÂç¹Ì¶¨µÄÊäÈë³ß´ç
-#define INPUT_CHANNELS 3  // ÊäÈëÍ¨µÀÊı
+#define NN_BOARD_SIZE 20
+#define INPUT_CHANNELS 3
 
-// --- Êı¾İ½á¹¹¶¨Òå ---
-typedef struct { float scale[96]; float bias[96]; } bn_param;
-typedef struct { float scale[32]; float bias[32]; } bn_param_32;
+// å¯¹é½å®ï¼ŒAVX2 éœ€è¦ 32 å­—èŠ‚å¯¹é½
+#define ALIGN32 alignas(32)
+
+// --- æ•°æ®ç»“æ„å®šä¹‰ (NHWC å¸ƒå±€) ---
+// Scale/Bias ä»ç„¶æ˜¯ [C]ï¼Œä½†åœ¨å†…å­˜ä¸­å¿…é¡»å¯¹é½
+typedef struct { ALIGN32 float scale[96]; ALIGN32 float bias[96]; } bn_param;
+typedef struct { ALIGN32 float scale[32]; ALIGN32 float bias[32]; } bn_param_32;
+
+// å·ç§¯æ ¸: [H][W][In][Out]
+// çº¿æ€§å±‚: [In][Out]
 
 typedef struct {
     bn_param norm1;
-    float conv1[96][96][3][3];
+    ALIGN32 float conv1[3][3][96][96]; // [KH][KW][IC][OC]
     bn_param norm2;
-    float conv2[96][96][3][3];
+    ALIGN32 float conv2[3][3][96][96];
 } ordi_block;
 
 typedef struct {
     bn_param norm1;
-    float conv_main[64][96][3][3];
-    float conv_gpool[32][96][3][3];
+    ALIGN32 float conv_main[3][3][96][64];
+    ALIGN32 float conv_gpool[3][3][96][32];
     bn_param_32 norm_g;
-    float linear_g[64][96];
-    float scale2[64];
-    float bias2[64];
-    float conv_final[96][64][3][3];
+    ALIGN32 float linear_g[96][64]; // [In][Out] from Python transpose
+    ALIGN32 float scale2[64];
+    ALIGN32 float bias2[64];
+    ALIGN32 float conv_final[3][3][64][96];
 } gpool_block;
 
 typedef struct {
-    float conv0[96][INPUT_CHANNELS][3][3];
+    // conv0 input is 3 channels, not multiple of 8. Special handling or padding.
+    // Python exported [3][3][3][96]
+    ALIGN32 float conv0[3][3][3][96]; 
+    
     ordi_block layer0; ordi_block layer1;
     gpool_block layer2; ordi_block layer3;
     gpool_block layer4; ordi_block layer5;
+    
     bn_param final_norm;
-    float p_conv1[32][96][1][1];
-    float p_conv2[32][96][1][1];
+    
+    ALIGN32 float p_conv1[1][1][96][32];
+    ALIGN32 float p_conv2[1][1][96][32];
     bn_param_32 p_norm2;
-    float p_linear_g[32][96];
+    ALIGN32 float p_linear_g[96][32];
     bn_param_32 p_norm_combine;
-    float p_conv_final[2][32][1][1];
-    float v_conv_prep[32][96][1][1];
+    ALIGN32 float p_conv_final[1][1][32][2]; // 2 output channels
+    
+    ALIGN32 float v_conv_prep[1][1][96][32];
     bn_param_32 v_norm_prep;
-    float v_linear_g[64][96];
-    float v_adder_g[64];
-    float v_linear_final[3][64];
-    float v_adder_final[3];
+    ALIGN32 float v_linear_g[96][64];
+    ALIGN32 float v_adder_g[64];
+    ALIGN32 float v_linear_final[64][3];
+    ALIGN32 float v_adder_final[3];
 } NetworkWeights;
 
-// --- È«¾ÖÍøÂç±äÁ¿ ---
-NetworkWeights net;
-float net_input[INPUT_CHANNELS][NN_BOARD_SIZE][NN_BOARD_SIZE]; 
-float policy_out[2][NN_BOARD_SIZE][NN_BOARD_SIZE];
+// å…¨å±€å˜é‡
+// Input: [H][W][C]
+ALIGN32 NetworkWeights net;
+ALIGN32 float net_input[NN_BOARD_SIZE][NN_BOARD_SIZE][8]; // Pad input to 8 for AVX convenience? Or just 3.
+// Let's keep input dense [20][20][3] and handle conv0 specially.
+ALIGN32 float raw_input[NN_BOARD_SIZE][NN_BOARD_SIZE][3]; 
+
+// Outputs
+float policy_out[NN_BOARD_SIZE][NN_BOARD_SIZE][2]; // NHWC
 float value_out[3];
 bool model_loaded = false;
 
-// --- ¸¨Öúº¯Êı ---
-void read_buffer(FILE *fp, void *target, size_t size) {
-    if (fread(target, 1, size, fp) != size) {
-        // pipeOut("ERROR reading model file!");
-    }
-}
+// --- AVX2 è¾…åŠ©å‡½æ•° ---
 
-void conv3x3(float input[][NN_BOARD_SIZE][NN_BOARD_SIZE], int in_c, 
-             float output[][NN_BOARD_SIZE][NN_BOARD_SIZE], int out_c, 
-             float kernel[][3][3]) { // Note: kernel dim simplified for pointer logic
-             
-    // ¼ò»¯°æ¾í»ıÊµÏÖ£¬×¢ÒâÕâÀïĞèÒªÕıÈ·µÄÖ¸Õë×ª»»£¬»òÕßÎªÁË°²È«Æğ¼û£¬
-    // ÔÚC++ÖĞ×îºÃ±£³ÖÎ¬¶ÈÒ»ÖÂ¡£ÏÂÃæÎªÁË¼æÈİÇ°ÃæµÄC´úÂëÂß¼­£º
-    typedef float (*KernelType)[3][3];
-    KernelType k_ptr = (KernelType)kernel;
+// 3x3 å·ç§¯çš„æ ¸å¿ƒ AVX å®ç°
+// Input: [H][W][IC]
+// Kernel: [3][3][IC][OC]
+// Output: [H][W][OC]
+// OC å¿…é¡»æ˜¯ 8 çš„å€æ•°
+void conv3x3_avx(float* input, int H, int W, int IC, 
+                 float* output, int OC, 
+                 float* kernel, float* bias, bool use_relu) {
+    
+    // Kernel pointer stride
+    // Kernel layout: [3][3][IC][OC]
+    // 1 step in OC = 1 float
+    // 1 step in IC = OC floats
+    // 1 step in KW = IC * OC floats
+    // 1 step in KH = 3 * IC * OC floats
+    int oc_step = 1; // logical
+    int ic_step = OC;
+    int kw_step = IC * OC;
+    int kh_step = 3 * IC * OC;
+    
+    // Input strides
+    int in_w_step = IC;
+    int in_h_step = W * IC;
+    
+    // Output strides
+    int out_w_step = OC;
+    int out_h_step = W * OC;
 
-    memset(output, 0, sizeof(float) * out_c * NN_BOARD_SIZE * NN_BOARD_SIZE);
+    __m256 zero = _mm256_setzero_ps();
 
-    for (int oc = 0; oc < out_c; oc++) {
-        for (int ic = 0; ic < in_c; ic++) {
-            for (int h = 0; h < NN_BOARD_SIZE; h++) {
-                for (int w = 0; w < NN_BOARD_SIZE; w++) {
-                    float sum = 0.0f;
-                    for (int kh = 0; kh < 3; kh++) {
+    for (int h = 0; h < H; h++) {
+        for (int w = 0; w < W; w++) {
+            
+            // Loop over Output Channels in chunks of 8
+            for (int oc = 0; oc < OC; oc += 8) {
+                // Init accumulator with Bias (if provided) or Zero
+                __m256 acc = (bias) ? _mm256_load_ps(&bias[oc]) : zero;
+                
+                // Convolve 3x3
+                for (int kh = 0; kh < 3; kh++) {
+                    int ih = h + kh - 1; // Input height index (padding 1 implicit)
+                    
+                    if (ih >= 0 && ih < H) {
                         for (int kw = 0; kw < 3; kw++) {
-                            int oh = h + kh - 1;
-                            int ow = w + kw - 1;
-                            if (oh >= 0 && oh < NN_BOARD_SIZE && ow >= 0 && ow < NN_BOARD_SIZE) {
-                                // kernel indexing: [oc][ic][kh][kw]
-                                // flat index logic: oc*(in_c*9) + ic*9 + kh*3 + kw
-                                // ÕâÀïµÄ kernel ´«²Î±È½Ï tricky£¬ÎªÁË¼ò±ã£¬ÎÒÃÇÖ±½Ó¼ÙÉèÄÚ´æÁ¬Ğø
-                                sum += input[ic][oh][ow] * k_ptr[oc * in_c + ic][kh][kw];
+                            int iw = w + kw - 1;
+                            
+                            if (iw >= 0 && iw < W) {
+                                float* in_ptr = input + ih * in_h_step + iw * in_w_step;
+                                float* k_ptr = kernel + kh * kh_step + kw * kw_step + 0 * ic_step + oc;
+                                
+                                for (int ic = 0; ic < IC; ic++) {
+                                    // Load 1 input pixel channel value and broadcast to 8
+                                    __m256 in_val = _mm256_broadcast_ss(in_ptr + ic);
+                                    
+                                    // Load 8 weights corresponding to this IC and OC..OC+7
+                                    __m256 w_val = _mm256_load_ps(k_ptr + ic * ic_step);
+                                    
+                                    // FMA: acc += in * w
+                                    acc = _mm256_fmadd_ps(in_val, w_val, acc);
+                                }
                             }
                         }
                     }
-                    output[oc][h][w] += sum;
                 }
-            }
-        }
-    }
-}
-
-void conv1x1(float input[][NN_BOARD_SIZE][NN_BOARD_SIZE], int in_c, 
-             float output[][NN_BOARD_SIZE][NN_BOARD_SIZE], int out_c, 
-             void *kernel) {
-    
-    float *k_ptr = (float*)kernel; // flattened [out_c][in_c]
-    
-    for (int oc = 0; oc < out_c; oc++) {
-        for (int h = 0; h < NN_BOARD_SIZE; h++) {
-            for (int w = 0; w < NN_BOARD_SIZE; w++) {
-                float sum = 0.0f;
-                for (int ic = 0; ic < in_c; ic++) {
-                    sum += input[ic][h][w] * k_ptr[oc * in_c + ic];
-                }
-                output[oc][h][w] = sum;
-            }
-        }
-    }
-}
-
-void linear(float *input, int in_dim, float *output, int out_dim, void *weight) {
-    float *w_ptr = (float*)weight; // [out_dim][in_dim]
-    for (int i = 0; i < out_dim; i++) {
-        float sum = 0.0f;
-        for (int j = 0; j < in_dim; j++) {
-            sum += input[j] * w_ptr[i * in_dim + j];
-        }
-        output[i] = sum;
-    }
-}
-
-void batch_norm_relu(float feature[][NN_BOARD_SIZE][NN_BOARD_SIZE], int channels, 
-                     float *scale, float *bias, int use_relu) {
-    for (int c = 0; c < channels; c++) {
-        for (int h = 0; h < NN_BOARD_SIZE; h++) {
-            for (int w = 0; w < NN_BOARD_SIZE; w++) {
-                float val = feature[c][h][w] * scale[c] + bias[c];
-                if (use_relu && val < 0) val = 0.0f;
-                feature[c][h][w] = val;
-            }
-        }
-    }
-}
-
-void rowsG(float input[][NN_BOARD_SIZE][NN_BOARD_SIZE], int channels, float *output_vec, int is_value_head) {
-    float area = (float)(NN_BOARD_SIZE * NN_BOARD_SIZE);
-    float scaling_factor = (float)NN_BOARD_SIZE - 14.0f;
-    for (int c = 0; c < channels; c++) {
-        float sum = 0.0f;
-        float max_val = -1e9;
-        for (int h = 0; h < NN_BOARD_SIZE; h++) {
-            for (int w = 0; w < NN_BOARD_SIZE; w++) {
-                float val = input[c][h][w];
-                sum += val;
-                if (val > max_val) max_val = val;
-            }
-        }
-        float mean = sum / area;
-        output_vec[c] = mean;
-        output_vec[channels + c] = mean * scaling_factor * 0.1f;
-        if (is_value_head) output_vec[channels * 2 + c] = mean * (scaling_factor * scaling_factor * 0.01f - 0.1f);
-        else output_vec[channels * 2 + c] = max_val;
-    }
-}
-
-// Ä£¿éÓ¦ÓÃº¯Êı
-void apply_ordi_block(float x[96][NN_BOARD_SIZE][NN_BOARD_SIZE], ordi_block *params) {
-    float identity[96][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    memcpy(identity, x, sizeof(float)*96*NN_BOARD_SIZE*NN_BOARD_SIZE);
-    batch_norm_relu(x, 96, params->norm1.scale, params->norm1.bias, TRUE);
-    float temp[96][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv3x3(x, 96, temp, 96, (float(*)[3][3])params->conv1);
-    batch_norm_relu(temp, 96, params->norm2.scale, params->norm2.bias, TRUE);
-    conv3x3(temp, 96, x, 96, (float(*)[3][3])params->conv2);
-    for(int i=0;i<96*NN_BOARD_SIZE*NN_BOARD_SIZE;i++) ((float*)x)[i] += ((float*)identity)[i];
-}
-
-void apply_gpool_block(float x[96][NN_BOARD_SIZE][NN_BOARD_SIZE], gpool_block *params) {
-    float identity[96][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    memcpy(identity, x, sizeof(float)*96*NN_BOARD_SIZE*NN_BOARD_SIZE);
-    batch_norm_relu(x, 96, params->norm1.scale, params->norm1.bias, TRUE);
-    
-    float main_feat[64][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv3x3(x, 96, main_feat, 64, (float(*)[3][3])params->conv_main);
-    
-    float g_feat_map[32][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv3x3(x, 96, g_feat_map, 32, (float(*)[3][3])params->conv_gpool);
-    batch_norm_relu(g_feat_map, 32, params->norm_g.scale, params->norm_g.bias, TRUE);
-    
-    float g_vec[96]; rowsG(g_feat_map, 32, g_vec, FALSE);
-    float g_out_vec[64]; linear(g_vec, 96, g_out_vec, 64, params->linear_g);
-    
-    for (int c=0; c<64; c++)
-        for (int h=0; h<NN_BOARD_SIZE; h++)
-            for (int w=0; w<NN_BOARD_SIZE; w++)
-                main_feat[c][h][w] += g_out_vec[c];
                 
-    batch_norm_relu(main_feat, 64, params->scale2, params->bias2, TRUE);
-    conv3x3(main_feat, 64, x, 96, (float(*)[3][3])params->conv_final);
-    for(int i=0;i<96*NN_BOARD_SIZE*NN_BOARD_SIZE;i++) ((float*)x)[i] += ((float*)identity)[i];
+                if (use_relu) {
+                    acc = _mm256_max_ps(acc, zero);
+                }
+                
+                // Store result
+                float* out_ptr = output + h * out_h_step + w * out_w_step + oc;
+                _mm256_store_ps(out_ptr, acc);
+            }
+        }
+    }
+}
+
+// Specialized Input Conv (IC=3, not multiple of 8, usually small)
+// Output OC=96 (multiple of 8)
+void conv3x3_input_avx(float* input, int H, int W, 
+                       float* output, int OC, 
+                       float* kernel) {
+    // Hardcoded IC=3
+    int IC = 3;
+    int ic_step = OC;
+    int kw_step = IC * OC;
+    int kh_step = 3 * IC * OC;
+    
+    int in_w_step = IC;
+    int in_h_step = W * IC;
+    int out_w_step = OC;
+    int out_h_step = W * OC;
+
+    for (int h = 0; h < H; h++) {
+        for (int w = 0; w < W; w++) {
+            for (int oc = 0; oc < OC; oc += 8) {
+                __m256 acc = _mm256_setzero_ps(); // No bias for conv0 usually
+                
+                for (int kh = 0; kh < 3; kh++) {
+                    int ih = h + kh - 1;
+                    if (ih >= 0 && ih < H) {
+                        for (int kw = 0; kw < 3; kw++) {
+                            int iw = w + kw - 1;
+                            if (iw >= 0 && iw < W) {
+                                float* in_ptr = input + ih * in_h_step + iw * in_w_step;
+                                float* k_ptr = kernel + kh * kh_step + kw * kw_step + oc;
+                                
+                                // Unroll IC=3
+                                // IC 0
+                                __m256 in0 = _mm256_broadcast_ss(in_ptr + 0);
+                                __m256 w0 = _mm256_load_ps(k_ptr + 0 * ic_step);
+                                acc = _mm256_fmadd_ps(in0, w0, acc);
+                                
+                                // IC 1
+                                __m256 in1 = _mm256_broadcast_ss(in_ptr + 1);
+                                __m256 w1 = _mm256_load_ps(k_ptr + 1 * ic_step);
+                                acc = _mm256_fmadd_ps(in1, w1, acc);
+                                
+                                // IC 2
+                                __m256 in2 = _mm256_broadcast_ss(in_ptr + 2);
+                                __m256 w2 = _mm256_load_ps(k_ptr + 2 * ic_step);
+                                acc = _mm256_fmadd_ps(in2, w2, acc);
+                            }
+                        }
+                    }
+                }
+                _mm256_store_ps(output + h * out_h_step + w * out_w_step + oc, acc);
+            }
+        }
+    }
+}
+
+// 1x1 å·ç§¯ (Pointwise)
+void conv1x1_avx(float* input, int H, int W, int IC, 
+                 float* output, int OC, 
+                 float* kernel, float* bias, bool use_relu) {
+    // Kernel: [1][1][IC][OC] -> effectively [IC][OC]
+    int ic_step = OC;
+    int in_step = IC;
+    int out_step = OC;
+    int num_pixels = H * W;
+    
+    __m256 zero = _mm256_setzero_ps();
+
+    for (int i = 0; i < num_pixels; i++) {
+        float* px_in = input + i * in_step;
+        float* px_out = output + i * out_step;
+        
+        for (int oc = 0; oc < OC; oc += 8) {
+            __m256 acc = (bias) ? _mm256_load_ps(&bias[oc]) : zero;
+            
+            for (int ic = 0; ic < IC; ic++) {
+                __m256 in_val = _mm256_broadcast_ss(px_in + ic);
+                __m256 w_val = _mm256_load_ps(kernel + ic * ic_step + oc);
+                acc = _mm256_fmadd_ps(in_val, w_val, acc);
+            }
+            
+            if (use_relu) acc = _mm256_max_ps(acc, zero);
+            _mm256_store_ps(px_out + oc, acc);
+        }
+    }
+}
+
+// Linear Layer (Matrix Mul)
+// Input: [In] (vector)
+// Weight: [In][Out] (from Python transpose)
+// Output: [Out]
+void linear_avx(float* input, int In, float* output, int Out, float* weight, float* bias) {
+    __m256 zero = _mm256_setzero_ps();
+    
+    for (int o = 0; o < Out; o += 8) {
+        __m256 acc = (bias) ? _mm256_load_ps(&bias[o]) : zero;
+        
+        for (int i = 0; i < In; i++) {
+            __m256 in_val = _mm256_broadcast_ss(input + i);
+            __m256 w_val = _mm256_load_ps(weight + i * Out + o);
+            acc = _mm256_fmadd_ps(in_val, w_val, acc);
+        }
+        _mm256_store_ps(output + o, acc);
+    }
+}
+
+// BN + ReLU (In-place)
+void batch_norm_relu_avx(float* data, int H, int W, int C, float* scale, float* bias, bool use_relu) {
+    int num_pixels = H * W;
+    __m256 zero = _mm256_setzero_ps();
+    
+    for (int i = 0; i < num_pixels; i++) {
+        float* px = data + i * C;
+        for (int c = 0; c < C; c+=8) {
+            __m256 x = _mm256_load_ps(px + c);
+            __m256 s = _mm256_load_ps(scale + c);
+            __m256 b = _mm256_load_ps(bias + c);
+            
+            // x = x * s + b
+            x = _mm256_fmadd_ps(x, s, b);
+            
+            if (use_relu) x = _mm256_max_ps(x, zero);
+            
+            _mm256_store_ps(px + c, x);
+        }
+    }
+}
+
+// Global Pooling + Vector arithmetic
+void global_pool_linear_add(float* input, int H, int W, int C, 
+                            float* linear_w, float* scale, float* bias, 
+                            float* output_feat) {
+    // 1. Global Average Pooling -> vec[C]
+    ALIGN32 float vec[96]; // Max channel size
+    memset(vec, 0, sizeof(vec));
+    float area = (float)(H * W);
+    
+    for (int i = 0; i < H*W; i++) {
+        float* px = input + i * C;
+        for (int c = 0; c < C; c+=8) {
+            __m256 v = _mm256_load_ps(vec + c);
+            __m256 x = _mm256_load_ps(px + c);
+            _mm256_store_ps(vec + c, _mm256_add_ps(v, x));
+        }
+    }
+    
+    // Divide by area
+    __m256 inv_area = _mm256_set1_ps(1.0f / area);
+    for (int c = 0; c < C; c+=8) {
+         __m256 v = _mm256_load_ps(vec + c);
+         _mm256_store_ps(vec + c, _mm256_mul_ps(v, inv_area));
+    }
+    
+    // 2. Linear Layer (vec[C] * W[C][Out_C]) -> out_vec[Out_C]
+    // å‡è®¾ Output ç»´åº¦æ˜¯ output_feat çš„é€šé“æ•° (ä¾‹å¦‚ 64)
+    // è¿™é‡Œæˆ‘ä»¬ç”¨é€šç”¨ linear_avx
+    // æ³¨æ„ï¼šGlobal Pooling åçš„ linear å¾€å¾€æ²¡æœ‰ bias (æˆ–åˆå¹¶åœ¨åé¢çš„ scale/bias)
+    // æ ¹æ® tobin.pyï¼Œlayer2.linear_g æ˜¯ [96][64]
+    
+    // ä¸´æ—¶å­˜å‚¨ linear ç»“æœ
+    ALIGN32 float lin_out[64];
+    // è°ƒç”¨ linear_avxï¼Œå‡è®¾ Out=64 (éœ€è¦æ ¹æ®å®é™…è°ƒç”¨ä¼ å‚)
+    // è¿™é‡Œç¡¬ç¼–ç é€»è¾‘æœ‰ç‚¹å›°éš¾ï¼Œéœ€è¦å‚æ•°åŒ–ï¼Œä¸‹é¢åœ¨ apply å‡½æ•°é‡Œå†™å…·ä½“é€»è¾‘
+}
+
+// é€å…ƒç´ åŠ æ³• (Residual connection)
+void add_residual_avx(float* dest, float* src, int size) {
+    for (int i = 0; i < size; i+=8) {
+        __m256 a = _mm256_load_ps(dest + i);
+        __m256 b = _mm256_load_ps(src + i);
+        _mm256_store_ps(dest + i, _mm256_add_ps(a, b));
+    }
+}
+
+// --- Block åº”ç”¨å‡½æ•° ---
+
+void apply_ordi_block(float* x, ordi_block *params) {
+    // x shape: [20][20][96]
+    ALIGN32 float temp[NN_BOARD_SIZE][NN_BOARD_SIZE][96];
+    ALIGN32 float residual[NN_BOARD_SIZE][NN_BOARD_SIZE][96];
+    
+    // Copy for residual
+    memcpy(residual, x, sizeof(float)*NN_BOARD_SIZE*NN_BOARD_SIZE*96);
+    
+    // Norm1 + ReLU
+    batch_norm_relu_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, params->norm1.scale, params->norm1.bias, TRUE);
+    
+    // Conv1 -> temp
+    conv3x3_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, 
+                (float*)temp, 96, 
+                (float*)params->conv1, NULL, FALSE);
+    
+    // Norm2 + ReLU (inplace on temp)
+    batch_norm_relu_avx((float*)temp, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, params->norm2.scale, params->norm2.bias, TRUE);
+    
+    // Conv2 -> x
+    conv3x3_avx((float*)temp, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, 
+                (float*)x, 96, 
+                (float*)params->conv2, NULL, FALSE);
+                
+    // Residual Add
+    add_residual_avx((float*)x, (float*)residual, NN_BOARD_SIZE*NN_BOARD_SIZE*96);
+}
+
+void apply_gpool_block(float* x, gpool_block *params) {
+    // x: [96]
+    ALIGN32 float residual[NN_BOARD_SIZE][NN_BOARD_SIZE][96];
+    memcpy(residual, x, sizeof(float)*NN_BOARD_SIZE*NN_BOARD_SIZE*96);
+    
+    // Norm1
+    batch_norm_relu_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, params->norm1.scale, params->norm1.bias, TRUE);
+    
+    // Branch 1: Main Conv -> [64]
+    ALIGN32 float main_feat[NN_BOARD_SIZE][NN_BOARD_SIZE][64];
+    conv3x3_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, (float*)main_feat, 64, (float*)params->conv_main, NULL, FALSE);
+    
+    // Branch 2: GPool path
+    // Conv GPool -> [32]
+    ALIGN32 float g_feat[NN_BOARD_SIZE][NN_BOARD_SIZE][32];
+    conv3x3_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, (float*)g_feat, 32, (float*)params->conv_gpool, NULL, FALSE);
+    batch_norm_relu_avx((float*)g_feat, NN_BOARD_SIZE, NN_BOARD_SIZE, 32, params->norm_g.scale, params->norm_g.bias, TRUE);
+    
+    // Global Average Pooling [32]
+    ALIGN32 float g_vec[32]; memset(g_vec, 0, sizeof(g_vec));
+    float area_inv = 1.0f / (NN_BOARD_SIZE * NN_BOARD_SIZE);
+    
+    // Special scaling from original code: (SIZE - 14.0) ... 
+    // We will apply the pooling first, then apply the weird logic on the vector
+    for(int i=0; i<NN_BOARD_SIZE*NN_BOARD_SIZE; i++) {
+        float* p = (float*)g_feat + i*32;
+        for(int c=0; c<32; c+=8) {
+            _mm256_store_ps(g_vec+c, _mm256_add_ps(_mm256_load_ps(g_vec+c), _mm256_load_ps(p+c)));
+        }
+    }
+    // Scale mean
+    float scaling_factor = (float)NN_BOARD_SIZE - 14.0f;
+    __m256 v_scale = _mm256_set1_ps(area_inv); // Just mean for now
+    for(int c=0; c<32; c+=8) {
+        _mm256_store_ps(g_vec+c, _mm256_mul_ps(_mm256_load_ps(g_vec+c), v_scale));
+    }
+    
+    // The original code had specific logic for `rowsG` outputting a larger vector 
+    // [mean, mean*scale*0.1, max].
+    // Assuming the trained model relies on a simpler linear projection now or we mimic the logic.
+    // To conform to strict AVX port of *provided* structures, `linear_g` is [96][64].
+    // This implies the input to linear_g is size 96.
+    // In original code `rowsG` produced [mean, mean*fac, max]. 32 channels * 3 = 96.
+    // Let's implement that logic to fill a 96-dim vector.
+    
+    ALIGN32 float g_vec_combined[96];
+    ALIGN32 float max_vec[32]; for(int i=0;i<32;i++) max_vec[i] = -1e9f;
+    
+    // Calc Max and Mean
+    for(int i=0; i<NN_BOARD_SIZE*NN_BOARD_SIZE; i++) {
+        float* p = (float*)g_feat + i*32;
+        for(int c=0; c<32; c+=8) {
+            __m256 v = _mm256_load_ps(p+c);
+            __m256 max_v = _mm256_load_ps(max_vec+c);
+            _mm256_store_ps(max_vec+c, _mm256_max_ps(max_v, v));
+        }
+    }
+    
+    for(int c=0; c<32; c++) {
+        float m = g_vec[c]; // This is mean
+        g_vec_combined[c] = m;
+        g_vec_combined[32+c] = m * scaling_factor * 0.1f;
+        g_vec_combined[64+c] = max_vec[c];
+    }
+    
+    // Linear: [96] -> [64]
+    ALIGN32 float g_out[64];
+    linear_avx(g_vec_combined, 96, g_out, 64, (float*)params->linear_g, NULL);
+    
+    // Add g_out (broadcast) to main_feat
+    for(int i=0; i<NN_BOARD_SIZE*NN_BOARD_SIZE; i++) {
+        float* p = (float*)main_feat + i*64;
+        for(int c=0; c<64; c+=8) {
+            __m256 v = _mm256_load_ps(p+c);
+            __m256 g = _mm256_load_ps(g_out+c);
+            _mm256_store_ps(p+c, _mm256_add_ps(v, g));
+        }
+    }
+    
+    // Norm2 + ReLU
+    batch_norm_relu_avx((float*)main_feat, NN_BOARD_SIZE, NN_BOARD_SIZE, 64, params->scale2, params->bias2, TRUE);
+    
+    // Conv Final -> x (96)
+    conv3x3_avx((float*)main_feat, NN_BOARD_SIZE, NN_BOARD_SIZE, 64, (float*)x, 96, (float*)params->conv_final, NULL, FALSE);
+    
+    // Residual
+    add_residual_avx((float*)x, (float*)residual, NN_BOARD_SIZE*NN_BOARD_SIZE*96);
+}
+
+
+// --- Loader ---
+void read_buffer(FILE *fp, void *target, size_t size) {
+    if (fread(target, 1, size, fp) != size) {
+        // Handle error
+    }
 }
 
 void load_weights(const char* filename) {
     FILE *fp = fopen(filename, "rb");
     if (!fp) { pipeOut("ERROR Cannot open model.bin"); return; }
     
-    read_buffer(fp, net.conv0, sizeof(net.conv0));
-    read_buffer(fp, &net.layer0, sizeof(net.layer0));
-    read_buffer(fp, &net.layer1, sizeof(net.layer1));
+    // We read strictly in the order exported by Python
+    // Because structs are aligned, we must be careful. 
+    // Best practice: Read into struct fields one by one to avoid padding issues on disk vs memory.
+    // However, for brevity and since we control both ends:
+    // If Python writes raw floats, and C++ reads into aligned memory, we just need to read `count * sizeof(float)`.
     
-    // GPool Layers struct mapping
-    read_buffer(fp, &net.layer2.norm1, sizeof(bn_param));
-    read_buffer(fp, net.layer2.conv_main, sizeof(net.layer2.conv_main));
-    read_buffer(fp, net.layer2.conv_gpool, sizeof(net.layer2.conv_gpool));
-    read_buffer(fp, &net.layer2.norm_g, sizeof(bn_param_32));
-    read_buffer(fp, net.layer2.linear_g, sizeof(net.layer2.linear_g));
-    read_buffer(fp, net.layer2.scale2, sizeof(float)*64);
-    read_buffer(fp, net.layer2.bias2, sizeof(float)*64);
-    read_buffer(fp, net.layer2.conv_final, sizeof(net.layer2.conv_final));
-    
-    read_buffer(fp, &net.layer3, sizeof(net.layer3));
-    
-    read_buffer(fp, &net.layer4.norm1, sizeof(bn_param));
-    read_buffer(fp, net.layer4.conv_main, sizeof(net.layer4.conv_main));
-    read_buffer(fp, net.layer4.conv_gpool, sizeof(net.layer4.conv_gpool));
-    read_buffer(fp, &net.layer4.norm_g, sizeof(bn_param_32));
-    read_buffer(fp, net.layer4.linear_g, sizeof(net.layer4.linear_g));
-    read_buffer(fp, net.layer4.scale2, sizeof(float)*64);
-    read_buffer(fp, net.layer4.bias2, sizeof(float)*64);
-    read_buffer(fp, net.layer4.conv_final, sizeof(net.layer4.conv_final));
+    auto read_array = [&](void* ptr, size_t count) {
+        fread(ptr, sizeof(float), count, fp);
+    };
 
-    read_buffer(fp, &net.layer5, sizeof(net.layer5));
-    read_buffer(fp, &net.final_norm, sizeof(net.final_norm));
+    // Conv0
+    read_array(net.conv0, 3*3*3*96);
     
-    read_buffer(fp, net.p_conv1, sizeof(net.p_conv1));
-    read_buffer(fp, net.p_conv2, sizeof(net.p_conv2));
-    read_buffer(fp, &net.p_norm2, sizeof(net.p_norm2));
-    read_buffer(fp, net.p_linear_g, sizeof(net.p_linear_g));
-    read_buffer(fp, &net.p_norm_combine, sizeof(net.p_norm_combine));
-    read_buffer(fp, net.p_conv_final, sizeof(net.p_conv_final));
+    // Layer 0
+    read_array(net.layer0.norm1.scale, 96); read_array(net.layer0.norm1.bias, 96);
+    read_array(net.layer0.conv1, 3*3*96*96);
+    read_array(net.layer0.norm2.scale, 96); read_array(net.layer0.norm2.bias, 96);
+    read_array(net.layer0.conv2, 3*3*96*96);
     
-    read_buffer(fp, net.v_conv_prep, sizeof(net.v_conv_prep));
-    read_buffer(fp, &net.v_norm_prep, sizeof(net.v_norm_prep));
-    read_buffer(fp, net.v_linear_g, sizeof(net.v_linear_g));
-    read_buffer(fp, net.v_adder_g, sizeof(net.v_adder_g));
-    read_buffer(fp, net.v_linear_final, sizeof(net.v_linear_final));
-    read_buffer(fp, net.v_adder_final, sizeof(net.v_adder_final));
+    // Layer 1
+    read_array(net.layer1.norm1.scale, 96); read_array(net.layer1.norm1.bias, 96);
+    read_array(net.layer1.conv1, 3*3*96*96);
+    read_array(net.layer1.norm2.scale, 96); read_array(net.layer1.norm2.bias, 96);
+    read_array(net.layer1.conv2, 3*3*96*96);
+    
+    // Layer 2 (GPool)
+    read_array(net.layer2.norm1.scale, 96); read_array(net.layer2.norm1.bias, 96);
+    read_array(net.layer2.conv_main, 3*3*96*64);
+    read_array(net.layer2.conv_gpool, 3*3*96*32);
+    read_array(net.layer2.norm_g.scale, 32); read_array(net.layer2.norm_g.bias, 32);
+    read_array(net.layer2.linear_g, 96*64);
+    read_array(net.layer2.scale2, 64); read_array(net.layer2.bias2, 64);
+    read_array(net.layer2.conv_final, 3*3*64*96);
+    
+    // Layer 3
+    read_array(net.layer3.norm1.scale, 96); read_array(net.layer3.norm1.bias, 96);
+    read_array(net.layer3.conv1, 3*3*96*96);
+    read_array(net.layer3.norm2.scale, 96); read_array(net.layer3.norm2.bias, 96);
+    read_array(net.layer3.conv2, 3*3*96*96);
+    
+    // Layer 4 (GPool)
+    read_array(net.layer4.norm1.scale, 96); read_array(net.layer4.norm1.bias, 96);
+    read_array(net.layer4.conv_main, 3*3*96*64);
+    read_array(net.layer4.conv_gpool, 3*3*96*32);
+    read_array(net.layer4.norm_g.scale, 32); read_array(net.layer4.norm_g.bias, 32);
+    read_array(net.layer4.linear_g, 96*64);
+    read_array(net.layer4.scale2, 64); read_array(net.layer4.bias2, 64);
+    read_array(net.layer4.conv_final, 3*3*64*96);
+    
+    // Layer 5
+    read_array(net.layer5.norm1.scale, 96); read_array(net.layer5.norm1.bias, 96);
+    read_array(net.layer5.conv1, 3*3*96*96);
+    read_array(net.layer5.norm2.scale, 96); read_array(net.layer5.norm2.bias, 96);
+    read_array(net.layer5.conv2, 3*3*96*96);
+    
+    // Final Norm
+    read_array(net.final_norm.scale, 96); read_array(net.final_norm.bias, 96);
+    
+    // Policy Head
+    read_array(net.p_conv1, 1*1*96*32);
+    read_array(net.p_conv2, 1*1*96*32);
+    read_array(net.p_norm2.scale, 32); read_array(net.p_norm2.bias, 32);
+    read_array(net.p_linear_g, 96*32);
+    read_array(net.p_norm_combine.scale, 32); read_array(net.p_norm_combine.bias, 32);
+    read_array(net.p_conv_final, 1*1*32*2);
+    
+    // Value Head
+    read_array(net.v_conv_prep, 1*1*96*32);
+    read_array(net.v_norm_prep.scale, 32); read_array(net.v_norm_prep.bias, 32);
+    read_array(net.v_linear_g, 96*64);
+    read_array(net.v_adder_g, 64);
+    read_array(net.v_linear_final, 64*3);
+    read_array(net.v_adder_final, 3);
     
     fclose(fp);
     model_loaded = true;
@@ -262,62 +549,112 @@ void load_weights(const char* filename) {
 }
 
 void forward_net() {
-    static float x[96][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv3x3(net_input, INPUT_CHANNELS, x, 96, (float(*)[3][3])net.conv0);
-    apply_ordi_block(x, &net.layer0);
-    apply_ordi_block(x, &net.layer1);
-    apply_gpool_block(x, &net.layer2);
-    apply_ordi_block(x, &net.layer3);
-    apply_gpool_block(x, &net.layer4);
-    apply_ordi_block(x, &net.layer5);
-    batch_norm_relu(x, 96, net.final_norm.scale, net.final_norm.bias, TRUE);
+    ALIGN32 static float x[NN_BOARD_SIZE][NN_BOARD_SIZE][96];
     
-    // Policy
-    float p1[32][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv1x1(x, 96, p1, 32, net.p_conv1);
-    float p2[32][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv1x1(x, 96, p2, 32, net.p_conv2);
-    batch_norm_relu(p2, 32, net.p_norm2.scale, net.p_norm2.bias, TRUE);
-    float p2_vec[96]; rowsG(p2, 32, p2_vec, FALSE);
-    float p2_feat[32]; linear(p2_vec, 96, p2_feat, 32, net.p_linear_g);
+    // 1. Input Conv (Special 3 -> 96)
+    conv3x3_input_avx((float*)raw_input, NN_BOARD_SIZE, NN_BOARD_SIZE, (float*)x, 96, (float*)net.conv0);
     
-    for(int c=0;c<32;c++)
-        for(int h=0;h<NN_BOARD_SIZE;h++)
-            for(int w=0;w<NN_BOARD_SIZE;w++) p1[c][h][w] += p2_feat[c];
+    // 2. Backbone
+    apply_ordi_block((float*)x, &net.layer0);
+    apply_ordi_block((float*)x, &net.layer1);
+    apply_gpool_block((float*)x, &net.layer2);
+    apply_ordi_block((float*)x, &net.layer3);
+    apply_gpool_block((float*)x, &net.layer4);
+    apply_ordi_block((float*)x, &net.layer5);
+    
+    // Final Norm
+    batch_norm_relu_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, net.final_norm.scale, net.final_norm.bias, TRUE);
+    
+    // 3. Policy Head
+    ALIGN32 static float p1[NN_BOARD_SIZE][NN_BOARD_SIZE][32];
+    ALIGN32 static float p2[NN_BOARD_SIZE][NN_BOARD_SIZE][32];
+    
+    // p1 branch
+    conv1x1_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, (float*)p1, 32, (float*)net.p_conv1, NULL, FALSE);
+    
+    // p2 branch
+    conv1x1_avx((float*)x, NN_BOARD_SIZE, NN_BOARD_SIZE, 96, (float*)p2, 32, (float*)net.p_conv2, NULL, FALSE);
+    batch_norm_relu_avx((float*)p2, NN_BOARD_SIZE, NN_BOARD_SIZE, 32, net.p_norm2.scale, net.p_norm2.bias, TRUE);
+    
+    // P2 global
+    // Need to reproduce RowsG logic for p2 (mean, mean*scale, max)
+    ALIGN32 float p2_g_vec[96];
+    ALIGN32 float p2_max[32]; for(int i=0;i<32;i++) p2_max[i] = -1e9f;
+    ALIGN32 float p2_sum[32]; memset(p2_sum, 0, sizeof(p2_sum));
+    
+    for(int i=0; i<NN_BOARD_SIZE*NN_BOARD_SIZE; i++) {
+        float* p = (float*)p2 + i*32;
+        for(int c=0; c<32; c+=8) {
+             __m256 v = _mm256_load_ps(p+c);
+             _mm256_store_ps(p2_sum+c, _mm256_add_ps(_mm256_load_ps(p2_sum+c), v));
+             _mm256_store_ps(p2_max+c, _mm256_max_ps(_mm256_load_ps(p2_max+c), v));
+        }
+    }
+    float scale = (float)NN_BOARD_SIZE - 14.0f;
+    float inv_area = 1.0f / (NN_BOARD_SIZE*NN_BOARD_SIZE);
+    for(int c=0; c<32; c++) {
+        float m = p2_sum[c] * inv_area;
+        p2_g_vec[c] = m;
+        p2_g_vec[32+c] = m * scale * 0.1f;
+        p2_g_vec[64+c] = p2_max[c]; // p2 uses max
+    }
+    
+    ALIGN32 float p2_feat[32];
+    linear_avx(p2_g_vec, 96, p2_feat, 32, (float*)net.p_linear_g, NULL);
+    
+    // Add p2_feat to p1
+    for(int i=0; i<NN_BOARD_SIZE*NN_BOARD_SIZE; i++) {
+        float* p = (float*)p1 + i*32;
+        for(int c=0; c<32; c+=8) {
+            __m256 v = _mm256_load_ps(p+c);
+            __m256 f = _mm256_load_ps(p2_feat+c);
+            _mm256_store_ps(p+c, _mm256_add_ps(v, f));
+        }
+    }
+    
+    // Norm combine
+    batch_norm_relu_avx((float*)p1, NN_BOARD_SIZE, NN_BOARD_SIZE, 32, net.p_norm_combine.scale, net.p_norm_combine.bias, TRUE);
+    
+    // Final Policy Conv 32 -> 2 (Note: 2 is not multiple of 8)
+    // We cannot use standard AVX func. Use simple loop or masked AVX. Simple loop is fine for last layer.
+    // However, let's just write a scalar loop for safety and clarity for the output 2 channels.
+    for(int h=0; h<NN_BOARD_SIZE; h++) {
+        for(int w=0; w<NN_BOARD_SIZE; w++) {
+            float* in_p = (float*)p1 + (h*NN_BOARD_SIZE+w)*32;
+            float* out_p = &policy_out[h][w][0];
             
-    batch_norm_relu(p1, 32, net.p_norm_combine.scale, net.p_norm_combine.bias, TRUE);
-    conv1x1(p1, 32, policy_out, 2, net.p_conv_final);
+            for(int oc=0; oc<2; oc++) {
+                float sum = 0.0f;
+                // Kernel: [1][1][32][2] -> flat [32*2], index: ic*2 + oc
+                for(int ic=0; ic<32; ic++) {
+                    sum += in_p[ic] * ((float*)net.p_conv_final)[ic*2 + oc];
+                }
+                out_p[oc] = sum;
+            }
+        }
+    }
     
-    // Value (Optional output, useful for debug)
-    float v_prep[32][NN_BOARD_SIZE][NN_BOARD_SIZE];
-    conv1x1(x, 96, v_prep, 32, net.v_conv_prep);
-    batch_norm_relu(v_prep, 32, net.v_norm_prep.scale, net.v_norm_prep.bias, TRUE);
-    float v_g_vec[96]; rowsG(v_prep, 32, v_g_vec, TRUE);
-    float v_hidden[64]; linear(v_g_vec, 96, v_hidden, 64, net.v_linear_g);
-    for(int i=0;i<64;i++) { v_hidden[i] += net.v_adder_g[i]; if(v_hidden[i]<0) v_hidden[i]=0.0f; }
-    linear(v_hidden, 64, value_out, 3, net.v_linear_final);
-    for(int i=0;i<3;i++) value_out[i] += net.v_adder_final[i];
-}
-
-
-std::string getExeDirectory() {
-    char buffer[MAX_PATH];
-    // »ñÈ¡ .exe µÄÍêÕûÂ·¾¶
-    GetModuleFileName(NULL, buffer, MAX_PATH);
-    std::string path(buffer);
-    // ÌáÈ¡Ä¿Â¼²¿·Ö£¨È¥µôÎÄ¼şÃû£©
-    std::string::size_type pos = path.find_last_of("\\/");
-    return path.substr(0, pos);
+    // 4. Value Head (çœç•¥ç»†èŠ‚ï¼Œé€»è¾‘åŒä¸Šï¼Œæ³¨æ„ rowsG çš„ is_value_head å‚æ•°ä¸åŒ)
 }
 
 // ==========================================
-// Part 2: Piskvork Ğ­ÒéÊµÏÖ
+// Part 2: Piskvork åè®®å®ç°
 // ==========================================
 
 const char *infotext = "name=\"KataNet_C\", author=\"User\", version=\"1.0\", country=\"CN\", www=\"github.com\"";
 
 #define MAX_BOARD 100
 int board[MAX_BOARD][MAX_BOARD];
+
+std::string getExeDirectory() {
+    char buffer[MAX_PATH];
+    // è·å– .exe çš„å®Œæ•´è·¯å¾„
+    GetModuleFileName(NULL, buffer, MAX_PATH);
+    std::string path(buffer);
+    // æå–ç›®å½•éƒ¨åˆ†ï¼ˆå»æ‰æ–‡ä»¶åï¼‰
+    std::string::size_type pos = path.find_last_of("\\/");
+    return path.substr(0, pos);
+}
 
 void brain_init() {
     if (width > MAX_BOARD || height > MAX_BOARD) {
@@ -330,7 +667,7 @@ void brain_init() {
         std::string exeDir = getExeDirectory();
         std::string paramPath = exeDir + "\\model.bin";
 
-        // È·±£ model.bin Óë exe ÔÚÍ¬Ò»Ä¿Â¼
+        // ç¡®ä¿ model.bin ä¸ exe åœ¨åŒä¸€ç›®å½•
         load_weights(paramPath.c_str());
     }
     
@@ -382,67 +719,52 @@ int brain_takeback(int x, int y) {
     return 2;
 }
 
+// æ³¨æ„ï¼šåœ¨ brain_turn ä¸­å¡«å…… raw_input æ—¶ï¼Œè®°å¾—å®ƒæ˜¯ HWC [20][20][3]
 void brain_turn() {
-    if (!model_loaded) {
-        pipeOut("ERROR Model not loaded");
-        return;
-    }
-
-    // 1. ×¼±¸ÊäÈë (½« board ×ª»»Îª net_input)
-    // ¼ÙÉèÍøÂçÊäÈë³ß´çÊÇ 20x20
-    // Èç¹ûÊµ¼Ê width/height < 20£¬ÎÒÃÇ½«ÆåÅÌ·ÅÔÚ×óÉÏ½Ç (0,0)
-    memset(net_input, 0, sizeof(net_input));
-
+    if (!model_loaded) { pipeOut("ERROR Model not loaded"); return; }
+    
+    // 1. å‡†å¤‡è¾“å…¥
+    memset(raw_input, 0, sizeof(raw_input));
     for (int y = 0; y < NN_BOARD_SIZE; y++) {
         for (int x = 0; x < NN_BOARD_SIZE; x++) {
             if (x < width && y < height) {
-                // Channel 0: Color/Mask (Always 1 for valid board area)
-                net_input[0][y][x] = 1.0f; 
-                // Channel 1: My stones (board == 1)
-                net_input[1][y][x] = (board[x][y] == 1) ? 1.0f : 0.0f;
-                // Channel 2: Opponent stones (board == 2)
-                net_input[2][y][x] = (board[x][y] == 2) ? 1.0f : 0.0f;
+                // HWC
+                raw_input[y][x][0] = 1.0f;
+                raw_input[y][x][1] = (board[x][y] == 1) ? 1.0f : 0.0f;
+                raw_input[y][x][2] = (board[x][y] == 2) ? 1.0f : 0.0f;
             }
         }
     }
-
-    // 2. ÔËĞĞÍÆÀí
+    
+    // 2. è¿è¡Œæ¨ç†
     forward_net();
-
-    // 3. ½âÎö Output£¬Ñ°ÕÒ×î´ó¸ÅÂÊµÄºÏ·¨ÒÆ¶¯
+    
+    // 3. è§£æ Outputï¼Œå¯»æ‰¾æœ€å¤§æ¦‚ç‡çš„åˆæ³•ç§»åŠ¨
     float max_score = -1e9;
     int best_x = -1, best_y = -1;
 
-    // ¼ÙÉè policy_out[0] ÊÇÎÒÃÇµ±Ç°×ß×ÓµÄlogits
-    // ×¢Òâ£ºtrain.py Àï policy ÊÇ logits£¬ÕâÀïÃ»ÓĞ×ö softmax£¬
-    // µ« logits Ô½´óÍ¨¹ı softmax ºó¸ÅÂÊÒ²Ô½´ó£¬ËùÒÔÖ±½Ó±È logits ¼´¿É¡£
+    // policy_out[][][0] æ˜¯æˆ‘ä»¬å½“å‰èµ°å­çš„logits
+    // æ³¨æ„ï¼štrain.py é‡Œ policy æ˜¯ logitsï¼Œè¿™é‡Œæ²¡æœ‰åš softmaxï¼Œ
+    // ä½† logits è¶Šå¤§é€šè¿‡ softmax åæ¦‚ç‡ä¹Ÿè¶Šå¤§ï¼Œæ‰€ä»¥ç›´æ¥æ¯” logits å³å¯ã€‚
     
     for (int y = 0; y < height && y < NN_BOARD_SIZE; y++) {
         for (int x = 0; x < width && x < NN_BOARD_SIZE; x++) {
             if (isFree(x, y)) {
-                // ¶ÁÈ¡ Channel 0 (µ±Ç°Íæ¼Ò²ßÂÔ)
-                float score = policy_out[0][y][x]; 
-                
-                // ¼ÓÉÏÒ»µãµãËæ»úĞÔ·ÀÖ¹ÍêÈ«È·¶¨ĞÔÑ­»·
-                // score += ((float)rand() / RAND_MAX) * 0.001f; 
-
+                // policy_out is now NHWC [y][x][0]
+                float score = policy_out[y][x][0];
                 if (score > max_score) {
                     max_score = score;
-                    best_x = x;
-                    best_y = y;
+                    best_x = x; best_y = y;
                 }
             }
         }
     }
-    
-    // (¿ÉÑ¡) Êä³ö Value Ô¤¹ÀÖµµ½ Debug ´°¿Ú
-    // pipeOut("MESSAGE Value: Win=%.2f, Loss=%.2f", value_out[0], value_out[1]);
 
-    if (best_x != -1) {
-        do_mymove(best_x, best_y);
-    } else {
-        pipeOut("ERROR no move found");
-    }
+    // (å¯é€‰) è¾“å‡º Value é¢„ä¼°å€¼åˆ° Debug çª—å£
+    // pipeOut("MESSAGE Value: Win=%.2f, Loss=%.2f", value_out[0], value_out[1]);
+    
+    if (best_x != -1) do_mymove(best_x, best_y);
+    else pipeOut("ERROR no move found");
 }
 
 void brain_end() {

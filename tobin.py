@@ -8,16 +8,15 @@ import sys
 # 导入你的网络定义
 from train import KataNet, STATE_LAYER_NUM
 
-MODEL_PATH = 'model/model.pth' # 确保这里指向你正确的模型路径
+MODEL_PATH = 'model/model.pth' 
 OUTPUT_BIN = 'model.bin'
 BOARD_SIZE = 20
 
 def get_bn_params(bn_layer):
     """
-    将PyTorch的BatchNorm层转换为推理用的 (scale, bias)
-    公式: 
-    scale = gamma / sqrt(var + eps)
-    bias = beta - mean * scale
+    导出 BN 参数 (scale, bias)
+    注意：在 NHWC 模式下，Scale 和 Bias 仍然是 [C] 的一维数组，不需要转置，
+    但在内存中它们将对应于最内层维度的连续块，非常适合 AVX 加载。
     """
     eps = bn_layer.eps
     mu = bn_layer.running_mean
@@ -31,18 +30,23 @@ def get_bn_params(bn_layer):
     return scale.detach().cpu().numpy(), bias.detach().cpu().numpy()
 
 def write_tensor(f, tensor):
-    """将tensor数据展平并写入文件"""
-    # 确保是float32
     data = tensor.detach().cpu().numpy().astype(np.float32)
     f.write(data.tobytes())
 
 def write_layer_conv(f, conv_layer):
-    print(f"  Exporting Conv: {conv_layer.weight.shape}")
-    write_tensor(f, conv_layer.weight)
+    # 原状: [Out, In, H, W]
+    # 目标: [H, W, In, Out] -> 对应 C++: kernel[kh][kw][ic][oc]
+    print(f"  Exporting Conv (H,W,I,O): {conv_layer.weight.shape}")
+    # permute(2, 3, 1, 0) 将 H,W 移到前面, In 放中间, Out 放最后
+    w = conv_layer.weight.permute(2, 3, 1, 0).contiguous()
+    write_tensor(f, w)
 
 def write_layer_linear(f, linear_layer):
-    print(f"  Exporting Linear: {linear_layer.weight.shape}")
-    write_tensor(f, linear_layer.weight)
+    # 原状: [Out, In]
+    # 目标: [In, Out] -> 使得计算 output[0..7] 时可以连续加载权重
+    print(f"  Exporting Linear (In, Out): {linear_layer.weight.shape}")
+    w = linear_layer.weight.t().contiguous()
+    write_tensor(f, w)
 
 def write_layer_bn(f, bn_layer):
     print(f"  Exporting BN (folded): {bn_layer.num_features}")
@@ -50,30 +54,19 @@ def write_layer_bn(f, bn_layer):
     f.write(scale.astype(np.float32).tobytes())
     f.write(bias.astype(np.float32).tobytes())
 
+# --- 以下 Block 导出逻辑保持不变，因为它们只是调用上面的原子函数 ---
 def write_ordi_block(f, block):
-    # OrdiBlock: Norm1 -> Conv1 -> Norm2 -> Conv2
     write_layer_bn(f, block.norm1)
     write_layer_conv(f, block.conv1)
     write_layer_bn(f, block.norm2)
     write_layer_conv(f, block.conv2)
 
 def write_gpool_block(f, block):
-    # GPoolBlock: 
-    # Norm1
-    # Main Branch: Conv_main
-    # G Branch: Conv_gpool -> Norm_g -> Linear_g
-    # Combine
-    # Norm2 -> Conv_final
-    
     write_layer_bn(f, block.norm1)
     write_layer_conv(f, block.conv_main)
-    
-    # GPool branch
     write_layer_conv(f, block.conv_gpool)
     write_layer_bn(f, block.norm_g)
     write_layer_linear(f, block.linear_g)
-    
-    # Post merge
     write_layer_bn(f, block.norm2)
     write_layer_conv(f, block.conv_final)
 
@@ -86,20 +79,16 @@ def export():
         return
 
     print(f"加载模型: {MODEL_PATH}")
-    # map_location='cpu' 确保在没显卡时也能跑
     state_dict = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
 
-    print(f"开始导出到 {OUTPUT_BIN} ...")
+    print(f"开始导出到 {OUTPUT_BIN} (Layout: NHWC, Kernel: HWIO) ...")
     
     with open(OUTPUT_BIN, 'wb') as f:
-        # 1. Input Conv
         print("Block: Input")
         write_layer_conv(f, model.conv0)
-        # linear0 在 forward 中没有使用，跳过导出
         
-        # 2. Trunk Blocks
         print("Block: Layer0 (Ordi)")
         write_ordi_block(f, model.layer0)
         print("Block: Layer1 (Ordi)")
@@ -113,41 +102,28 @@ def export():
         print("Block: Layer5 (Ordi)")
         write_ordi_block(f, model.layer5)
         
-        # 3. Final Norm
         print("Block: Final Norm")
         write_layer_bn(f, model.final_norm)
         
-        # 4. Policy Head
         print("Block: Policy Head")
-        # p1 = conv1
         write_layer_conv(f, model.p_conv1)
-        # p2 path = conv2 -> norm2 -> linear_g
         write_layer_conv(f, model.p_conv2)
         write_layer_bn(f, model.p_norm2)
         write_layer_linear(f, model.p_linear_g)
-        # combined -> norm -> conv_final
         write_layer_bn(f, model.p_norm_combine)
         write_layer_conv(f, model.p_conv_final)
         
-        # 5. Value Head
         print("Block: Value Head")
-        # conv_prep -> norm_prep
         write_layer_conv(f, model.v_conv_prep)
         write_layer_bn(f, model.v_norm_prep)
-        
-        # linear_g (bias=False in definition, but uses adder_g parameter manually)
-        # PyTorch: self.v_linear_g(v_g_vec) + self.v_adder_g
-        # 我们可以把 adder_g 当作 bias 导出，C语言里 linear 层可能需要支持 bias 或者我们在C里手动加
         write_layer_linear(f, model.v_linear_g)
         print("  Exporting Value Global Bias")
         write_tensor(f, model.v_adder_g)
-        
-        # linear_final + adder_final
         write_layer_linear(f, model.v_linear_final)
         print("  Exporting Value Final Bias")
         write_tensor(f, model.v_adder_final)
         
-    print("导出完成！")
+    print("导出完成！请重新将新的 model.bin 与 C++ 引擎 打包。")
 
 if __name__ == "__main__":
     export()

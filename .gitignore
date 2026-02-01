@@ -1,2 +1,6 @@
 *.exe
 *.zip
+__pycache__
+model.bin
+*.dll
+model
