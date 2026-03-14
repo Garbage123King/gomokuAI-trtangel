@@ -25,7 +25,7 @@ Everything is inspired from Katago paper and code.
 python tobin.py
 cp model.bin gomocup/
 cd gomocup
-g++ -O3 -mavx2 -mfma gomocup.cpp pisqpipe.cpp -o pbrain-angel2026 --static
+g++ -O3 -mavx2 -mfma -ffast-math gomocup.cpp pisqpipe.cpp -o pbrain-angel2026 --static -I "C:/libs/eigen-5.0.0"
 // Then zip pbrain-angel2026 and model.bin
  ```
 
