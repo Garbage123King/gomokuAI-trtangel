@@ -1,23 +1,22 @@
-g++ -g -DDEBUG -I/home/dashi/Downloads/TensorRT-10.2.0.19/include -I/usr/local/cuda-12.5/targets/x86_64-linux/include trtangel.cpp -L/home/dashi/Downloads/TensorRT-10.2.0.19/lib -L/usr/local/cuda-12.5/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart \
-    -I/home/dashi/Downloads/imgui-1.92.3 -I/home/dashi/Downloads/imgui-1.92.3/backends \
-    /home/dashi/Downloads/imgui-1.92.3/imgui.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/imgui_draw.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/imgui_widgets.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/imgui_tables.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/backends/imgui_impl_glfw.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/backends/imgui_impl_opengl3.cpp \
+g++ -g -DDEBUG -I/home/easyai/TensorRT-10.16.1.11/include -I/usr/local/cuda/targets/x86_64-linux/include trtangel.cpp -L/home/easyai/TensorRT-10.16.1.11/lib -L/usr/local/cuda/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart \
+    -I/home/easyai/imgui-1.92.3 -I/home/easyai/imgui-1.92.3/backends \
+    /home/easyai/imgui-1.92.3/imgui.cpp \
+    /home/easyai/imgui-1.92.3/imgui_draw.cpp \
+    /home/easyai/imgui-1.92.3/imgui_widgets.cpp \
+    /home/easyai/imgui-1.92.3/imgui_tables.cpp \
+    /home/easyai/imgui-1.92.3/backends/imgui_impl_glfw.cpp \
+    /home/easyai/imgui-1.92.3/backends/imgui_impl_opengl3.cpp \
     -lglfw -lGL -ldl -pthread -lcnpy -lz -o trtangel_debug
 
-g++ -O2 -I/home/dashi/Downloads/TensorRT-10.2.0.19/include -I/usr/local/cuda-12.5/targets/x86_64-linux/include trtangel.cpp -L/home/dashi/Downloads/TensorRT-10.2.0.19/lib -L/usr/local/cuda-12.5/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart \
-    -I/home/dashi/Downloads/imgui-1.92.3 -I/home/dashi/Downloads/imgui-1.92.3/backends \
-    /home/dashi/Downloads/imgui-1.92.3/imgui.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/imgui_draw.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/imgui_widgets.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/imgui_tables.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/backends/imgui_impl_glfw.cpp \
-    /home/dashi/Downloads/imgui-1.92.3/backends/imgui_impl_opengl3.cpp \
-    -lglfw -lGL -ldl -pthread -lcnpy -lz -o trtangel_release
+g++ -O2 -I/home/easyai/TensorRT-10.16.1.11/include -I/usr/local/cuda/targets/x86_64-linux/include trtangel.cpp -L/home/easyai/TensorRT-10.16.1.11/lib -L/usr/local/cuda/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart \
+    -I/home/easyai/imgui-1.92.3 -I/home/easyai/imgui-1.92.3/backends \
+    /home/easyai/imgui-1.92.3/imgui.cpp \
+    /home/easyai/imgui-1.92.3/imgui_draw.cpp \
+    /home/easyai/imgui-1.92.3/imgui_widgets.cpp \
+    /home/easyai/imgui-1.92.3/imgui_tables.cpp \
+    /home/easyai/imgui-1.92.3/backends/imgui_impl_glfw.cpp \
+    /home/easyai/imgui-1.92.3/backends/imgui_impl_opengl3.cpp \
+    -lglfw -lGL -ldl -pthread -lz -lcnpy -o trtangel_release
 
-# g++ -g -DDEBUG -DRUN_TESTS -I/home/dashi/Downloads/TensorRT-10.2.0.19/include -I/usr/local/cuda-12.5/targets/x86_64-linux/include unittest.cpp -L/home/dashi/Downloads/TensorRT-10.2.0.19/lib -L/usr/local/cuda-12.5/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart -o unittest_debug
-
-# g++ -g -DDEBUG -DUSE_FIXED_SEED -I/home/dashi/Downloads/TensorRT-10.2.0.19/include -I/usr/local/cuda-12.5/targets/x86_64-linux/include trtangel.cpp -L/home/dashi/Downloads/TensorRT-10.2.0.19/lib -L/usr/local/cuda-12.5/targets/x86_64-linux/lib -lnvinfer -lnvonnxparser -lcudart -o trtangel_fixed_seed
+# export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:/home/easyai/TensorRT-10.16.1.11/lib:$LD_LIBRARY_PATH
+# export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH

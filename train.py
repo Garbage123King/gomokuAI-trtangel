@@ -650,10 +650,14 @@ class KataNet(nn.Module):
         # Blocks
         self.layer0 = OrdiBlock(96)
         self.layer1 = OrdiBlock(96)
-        self.layer2 = GPoolBlock(96, 64, 32)
+        self.layer2 = OrdiBlock(96)
         self.layer3 = OrdiBlock(96)
         self.layer4 = GPoolBlock(96, 64, 32)
         self.layer5 = OrdiBlock(96)
+        self.layer6 = OrdiBlock(96)
+        self.layer7 = GPoolBlock(96, 64, 32)
+        self.layer8 = OrdiBlock(96)
+        self.layer9 = OrdiBlock(96)
         
         # Final Norm
         self.final_norm = nn.BatchNorm2d(96)
@@ -725,6 +729,10 @@ class KataNet(nn.Module):
         x = self.layer3(x, board_size)
         x = self.layer4(x, board_size)
         x = self.layer5(x, board_size)
+        x = self.layer6(x, board_size)
+        x = self.layer7(x, board_size)
+        x = self.layer8(x, board_size)
+        x = self.layer9(x, board_size)
         
         trunk_out = torch.relu(self.final_norm(x))
         
